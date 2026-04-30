@@ -370,8 +370,10 @@ def main():
     p.add_argument("--bars", type=int, default=8)
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--logz-lr", type=float, default=5e-2)
-    p.add_argument("--epsilon", type=float, default=0.05)
+    p.add_argument("--logz-lr", type=float, default=1e-3)
+    p.add_argument("--epsilon", type=float, default=0.10)
+    p.add_argument("--eval-every", type=int, default=100)
+    p.add_argument("--logz-init", type=str, default="auto", help="auto or numeric. auto≈n_cells*log(n_tokens)")
     args = p.parse_args()
 
     out = Path(args.out)
@@ -386,7 +388,9 @@ def main():
 
     pf = DiscretePolicyEstimator(module_pf, env.n_actions, is_backward=False, preprocessor=pre)
     pb = DiscretePolicyEstimator(module_pb, env.n_actions, is_backward=True, preprocessor=pre)
-    gfn = TBGFlowNet(pf=pf, pb=pb, init_logZ=0.0)
+    init_logz = cfg.n_cells * math.log(cfg.n_tokens) if args.logz_init == "auto" else float(args.logz_init)
+    gfn = TBGFlowNet(pf=pf, pb=pb, init_logZ=init_logz)
+    print(f"init_logZ={init_logz:.2f}; n_cells={cfg.n_cells}; rough trajectory length={cfg.n_cells}")
     sampler = Sampler(estimator=pf)
 
     optimizer = torch.optim.Adam(gfn.pf_pb_parameters(), lr=args.lr)
@@ -410,7 +414,7 @@ def main():
         optimizer.step()
         losses.append(float(loss.item()))
 
-        if step % 50 == 0 or step == args.steps - 1:
+        if step % args.eval_every == 0 or step == args.steps - 1:
             st, rew = sample_best(gfn, env, n=32)
             if rew > best_reward:
                 best_reward = rew

@@ -34,3 +34,19 @@ Outputs:
 
 This is intentionally small and discrete. Each action fills the next grid cell with one token.
 The GFlowNet objective is `TBGFlowNet` from `torchgfn`.
+
+## Notes on loss scale
+
+Trajectory Balance loss contains a sum of log-probabilities over the whole trajectory. For an 8-bar loop this is roughly 512 token decisions, so initializing `logZ=0` makes the initial loss enormous. This version uses `--logz-init auto`, approximately `n_cells * log(n_tokens)`, which is a much better starting point.
+
+Fast smoke test:
+
+```bash
+python train_torchgfn_music.py --steps 300 --batch 16 --bars 2 --hidden 128 --device cpu --out out_smoke
+```
+
+More realistic run:
+
+```bash
+python train_torchgfn_music.py --steps 3000 --batch 32 --bars 8 --hidden 256 --device cuda --out out
+```
