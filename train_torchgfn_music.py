@@ -44,6 +44,9 @@ DRUM_TOKENS = {0: [], 1: [36], 2: [38], 3: [42], 4: [36, 42], 5: [38, 42]}
 # bass/lead/chord tokens are interpreted diatonically in C minor-ish.
 SCALE = np.array([0, 2, 3, 5, 7, 8, 10])  # natural minor degrees
 ROOT = 48
+BASS_TOKENS = (0, 1, 2, 3, 4, 5, 6, 7)
+CHORD_TOKENS = (0, 1, 3, 4, 5, 6)
+LEAD_TOKENS = (0, 1, 2, 3, 4, 5, 6, 7)
 
 
 @dataclass
@@ -53,7 +56,7 @@ class MusicConfig:
     tracks: int = 4
     n_tokens: int = 12  # tokens 0..11; meaning depends on track
     bpm: int = 120
-    reward_temperature: float = 1.0
+    reward_temperature: float = 0.3
 
     @property
     def seq_steps(self) -> int:
@@ -73,6 +76,59 @@ def flat_index_to_step_track(idx: torch.Tensor, tracks: int) -> tuple[torch.Tens
     step = idx // tracks
     track = idx % tracks
     return step, track
+
+
+def action_token_masks(pos: torch.Tensor, cfg: MusicConfig) -> torch.Tensor:
+    """Restrict the search space to a small, structured musical vocabulary."""
+    masks = torch.zeros((*pos.shape, cfg.n_tokens), dtype=torch.bool, device=pos.device)
+    cell = torch.clamp(pos, min=0, max=cfg.n_cells - 1)
+    step, track = flat_index_to_step_track(cell, cfg.tracks)
+    beat = step % cfg.steps_per_bar
+
+    drums = track == DRUM
+    if drums.any():
+        drum_masks = torch.zeros((int(drums.sum().item()), cfg.n_tokens), dtype=torch.bool, device=pos.device)
+        drum_beat = beat[drums]
+        # Force a small groove vocabulary: kick on 1, snare on 2/4, hats on eighths.
+        drum_masks[:, REST] = True
+        downbeat = drum_beat == 0
+        backbeat = (drum_beat == 4) | (drum_beat == 12)
+        off8 = (drum_beat % 4) == 2
+        drum_masks[downbeat, 1] = True
+        drum_masks[downbeat, 4] = True
+        drum_masks[backbeat, 2] = True
+        drum_masks[backbeat, 5] = True
+        drum_masks[off8, 3] = True
+        drum_masks[~(downbeat | backbeat | off8), 3] = True
+        masks[drums] = drum_masks
+
+    bass = track == BASS
+    if bass.any():
+        for token in BASS_TOKENS:
+            masks[..., token][bass] = True
+
+    chord = track == CHORD
+    if chord.any():
+        for token in CHORD_TOKENS:
+            masks[..., token][chord] = True
+
+    lead = track == LEAD
+    if lead.any():
+        for token in LEAD_TOKENS:
+            masks[..., token][lead] = True
+
+    return masks
+
+
+def token_degree(track: torch.Tensor) -> torch.Tensor:
+    return torch.remainder(torch.clamp(track.long(), min=1) - 1, len(SCALE))
+
+
+def chord_members(chord: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    root = token_degree(chord)
+    third = torch.remainder(root + 2, len(SCALE))
+    fifth = torch.remainder(root + 4, len(SCALE))
+    return root, third, fifth
 
 
 # -----------------------------
@@ -139,7 +195,9 @@ class MusicLoopEnv(DiscreteEnv):
                 masks = torch.zeros((*self.batch_shape, env.n_actions), dtype=torch.bool, device=self.device)
                 can_fill = (pos >= 0) & (pos < env.cfg.n_cells)
                 can_exit = pos == env.cfg.n_cells
-                masks[..., : env.cfg.n_tokens] = can_fill.unsqueeze(-1)
+                if can_fill.any():
+                    token_masks = action_token_masks(pos, env.cfg)
+                    masks[..., : env.cfg.n_tokens] = token_masks & can_fill.unsqueeze(-1)
                 masks[..., env.cfg.n_tokens] = can_exit
                 return masks
 
@@ -190,13 +248,14 @@ class MusicLoopEnv(DiscreteEnv):
 def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tensor:
     """Positive terminal reward, returned as log reward.
 
-    This is deliberately simple but usable:
-    - drums get bonuses for kick on downbeats, snare on beats 2/4, hats on offbeats
-    - bass/chords/lead get bonuses for scale tones and phrase repetition with variation
-    - density avoids all-rest and all-noise solutions
+    The reward is intentionally sharp:
+    - drums get a hard groove anchor: kick on beat 1, snare on beats 2/4
+    - bass is rewarded for landing inside the current chord triad
+    - repeated bars and controlled variations are rewarded explicitly
+    - density terms prevent all-rest and overfilled loops
     """
     B = state_tensor.shape[0]
-    grid = state_tensor[:, 1:].view(B, cfg.seq_steps, cfg.tracks).float()
+    grid = state_tensor[:, 1:].view(B, cfg.seq_steps, cfg.tracks).long()
     device = grid.device
 
     steps = torch.arange(cfg.seq_steps, device=device)
@@ -210,56 +269,69 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
     chord = grid[:, :, CHORD]
     lead = grid[:, :, LEAD]
 
-    # Drum groove
-    kick_score = ((drums == 1) | (drums == 4)).float()[:, downbeat].mean(dim=1)
-    snare_score = ((drums == 2) | (drums == 5)).float()[:, backbeat].mean(dim=1)
-    hat_score = ((drums == 3) | (drums == 4) | (drums == 5)).float()[:, off8].mean(dim=1)
+    # Drum groove: strong anchor first, density second.
+    kick = (drums == 1) | (drums == 4)
+    snare = (drums == 2) | (drums == 5)
+    hat = (drums == 3) | (drums == 4) | (drums == 5)
+    kick_score = kick[:, downbeat].float().mean(dim=1)
+    snare_score = snare[:, backbeat].float().mean(dim=1)
+    hat_score = hat[:, off8].float().mean(dim=1)
     drum_density = (drums != REST).float().mean(dim=1)
-    drum_score = 0.30 * kick_score + 0.30 * snare_score + 0.20 * hat_score - 0.20 * (drum_density - 0.45).abs()
+    drum_score = 2.0 * kick_score + 2.0 * snare_score + 0.8 * hat_score - 0.8 * (drum_density - 0.45).abs()
 
-    # Tonal coherence: non-rest notes should mostly be low token ids mapped to scale degrees.
-    # Here tokens 1..7 are scale degrees, 8..11 are allowed spice but mildly penalized.
-    def tonal_score(track):
-        active = track != REST
-        active_ratio = active.float().mean(dim=1)
-        in_scale = ((track >= 1) & (track <= 7)).float()
-        denom = active.float().sum(dim=1).clamp_min(1.0)
-        scale_frac = (in_scale * active.float()).sum(dim=1) / denom
-        density_pen = (active_ratio - 0.35).abs()
-        return 0.7 * scale_frac - 0.3 * density_pen
+    # Harmony: bass should be a chord tone, especially on downbeats.
+    bass_active = bass != REST
+    chord_active = chord != REST
+    root, third, fifth = chord_members(chord)
+    bass_deg = token_degree(bass)
+    bass_in_chord = (bass_deg == root) | (bass_deg == third) | (bass_deg == fifth)
+    active_harmony = bass_active & chord_active
+    harmony_denom = active_harmony.float().sum(dim=1).clamp_min(1.0)
+    harmony_score = (bass_in_chord.float() * active_harmony.float()).sum(dim=1) / harmony_denom
+    downbeat_harmony = (
+        bass_in_chord.float()[:, downbeat]
+        * bass_active.float()[:, downbeat]
+        * chord_active.float()[:, downbeat]
+    ).mean(dim=1)
 
-    bass_score = tonal_score(bass) + 0.15 * ((bass != REST).float()[:, downbeat].mean(dim=1))
-    lead_score = tonal_score(lead)
-    chord_score = tonal_score(chord) + 0.10 * ((chord != REST).float()[:, downbeat].mean(dim=1))
+    bass_density = bass_active.float().mean(dim=1)
+    lead_density = (lead != REST).float().mean(dim=1)
+    chord_downbeat = chord_active.float()[:, downbeat].mean(dim=1)
+    bass_downbeat = bass_active.float()[:, downbeat].mean(dim=1)
+    chord_score = 1.4 * chord_downbeat - 0.5 * (chord_active.float().mean(dim=1) - 0.25).abs()
+    bass_score = 1.3 * harmony_score + 0.9 * downbeat_harmony + 0.5 * bass_downbeat - 0.7 * (bass_density - 0.25).abs()
+    lead_score = 0.8 - 1.2 * (lead_density - 0.28).abs()
 
-    # Motif: first 2 bars repeated later, but not exactly everywhere.
-    phrase = cfg.steps_per_bar * 2
-    if cfg.seq_steps >= phrase * 2:
-        a = lead[:, :phrase]
-        b = lead[:, phrase : 2 * phrase]
-        c = lead[:, -phrase:]
-        repeat_ab = (a == b).float().mean(dim=1)
-        variation_ac = 1.0 - (a == c).float().mean(dim=1)
-        motif_score = 0.6 * repeat_ab + 0.4 * variation_ac
+    # Repetition: bar 1 -> bar 2 should lock; later bars can vary but stay related.
+    if cfg.bars >= 2:
+        bars = grid.view(B, cfg.bars, cfg.steps_per_bar, cfg.tracks)
+        bar1 = bars[:, 0]
+        bar2 = bars[:, 1]
+        repeat_all = (bar1 == bar2).float().mean(dim=(1, 2))
+        repeat_rhythm = (bar1[:, :, DRUM] == bar2[:, :, DRUM]).float().mean(dim=1)
+        repeat_harmony = (bar1[:, :, CHORD] == bar2[:, :, CHORD]).float().mean(dim=1)
+        repetition_score = 2.0 * repeat_all + 1.0 * repeat_rhythm + 1.0 * repeat_harmony
+        if cfg.bars >= 4:
+            bar3 = bars[:, 2]
+            bar4 = bars[:, 3]
+            variation_13 = (bar1 == bar3).float().mean(dim=(1, 2))
+            variation_24 = (bar2 == bar4).float().mean(dim=(1, 2))
+            # Aim for recognizable variation, not a clone and not unrelated noise.
+            target = torch.full_like(variation_13, 0.65)
+            repetition_score = repetition_score + 1.2 * (1.0 - (variation_13 - target).abs())
+            repetition_score = repetition_score + 0.8 * (1.0 - (variation_24 - target).abs())
     else:
-        motif_score = torch.zeros(B, device=device)
-
-    # Harmony proxy: chord token and bass token often agree modulo 7 on active downbeats.
-    active_h = (bass != REST) & (chord != REST)
-    agree = (((bass - chord).abs() % 7) == 0).float()
-    denom = active_h.float().sum(dim=1).clamp_min(1.0)
-    harmony_score = (agree * active_h.float()).sum(dim=1) / denom
+        repetition_score = torch.zeros(B, device=device)
 
     score = (
-        1.1 * drum_score
-        + 0.8 * bass_score
-        + 0.7 * chord_score
+        1.4 * drum_score
+        + 1.3 * bass_score
+        + 1.0 * chord_score
         + 0.8 * lead_score
-        + 0.7 * motif_score
-        + 0.5 * harmony_score
+        + 1.4 * repetition_score
     )
-    # Keep reward strictly positive via log R = score / T. Clamp for numerical stability.
-    return torch.clamp(score / cfg.reward_temperature, min=-8.0, max=8.0)
+    # R = exp(score / T). Clamp only for numerical stability.
+    return torch.clamp(score / cfg.reward_temperature, min=-12.0, max=20.0)
 
 
 # -----------------------------
