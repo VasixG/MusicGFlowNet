@@ -47,6 +47,9 @@ ROOT = 48
 BASS_TOKENS = (0, 1, 2, 3, 4, 5, 6, 7)
 CHORD_TOKENS = (0, 1, 3, 4, 5, 6)
 LEAD_TOKENS = (0, 1, 2, 3, 4, 5, 6, 7)
+LOG_REWARD_MIN = -5.0
+LOG_REWARD_MAX = 5.0
+SCORE_RANGE = 2.0
 
 
 @dataclass
@@ -56,7 +59,7 @@ class MusicConfig:
     tracks: int = 4
     n_tokens: int = 12  # tokens 0..11; meaning depends on track
     bpm: int = 120
-    reward_temperature: float = 1.0
+    reward_temperature: float = 2.0
 
     @property
     def seq_steps(self) -> int:
@@ -79,45 +82,12 @@ def flat_index_to_step_track(idx: torch.Tensor, tracks: int) -> tuple[torch.Tens
 
 
 def action_token_masks(pos: torch.Tensor, cfg: MusicConfig) -> torch.Tensor:
-    """Restrict the search space to a small, structured musical vocabulary."""
-    masks = torch.zeros((*pos.shape, cfg.n_tokens), dtype=torch.bool, device=pos.device)
-    cell = torch.clamp(pos, min=0, max=cfg.n_cells - 1)
-    step, track = flat_index_to_step_track(cell, cfg.tracks)
-    beat = step % cfg.steps_per_bar
+    """Allow the full token vocabulary.
 
-    drums = track == DRUM
-    if drums.any():
-        drum_masks = torch.zeros((int(drums.sum().item()), cfg.n_tokens), dtype=torch.bool, device=pos.device)
-        drum_beat = beat[drums]
-        # Force a small groove vocabulary: kick on 1, snare on 2/4, hats on eighths.
-        drum_masks[:, REST] = True
-        downbeat = drum_beat == 0
-        backbeat = (drum_beat == 4) | (drum_beat == 12)
-        off8 = (drum_beat % 4) == 2
-        drum_masks[downbeat, 1] = True
-        drum_masks[downbeat, 4] = True
-        drum_masks[backbeat, 2] = True
-        drum_masks[backbeat, 5] = True
-        drum_masks[off8, 3] = True
-        drum_masks[~(downbeat | backbeat | off8), 3] = True
-        masks[drums] = drum_masks
-
-    bass = track == BASS
-    if bass.any():
-        for token in BASS_TOKENS:
-            masks[..., token][bass] = True
-
-    chord = track == CHORD
-    if chord.any():
-        for token in CHORD_TOKENS:
-            masks[..., token][chord] = True
-
-    lead = track == LEAD
-    if lead.any():
-        for token in LEAD_TOKENS:
-            masks[..., token][lead] = True
-
-    return masks
+    Musical preferences belong in the reward. Hard action masks made a single
+    repeated pattern too easy to dominate the distribution.
+    """
+    return torch.ones((*pos.shape, cfg.n_tokens), dtype=torch.bool, device=pos.device)
 
 
 def token_degree(track: torch.Tensor) -> torch.Tensor:
@@ -129,6 +99,18 @@ def chord_members(chord: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torc
     third = torch.remainder(root + 2, len(SCALE))
     fifth = torch.remainder(root + 4, len(SCALE))
     return root, third, fifth
+
+
+def normalized_token_entropy(track: torch.Tensor, n_tokens: int) -> torch.Tensor:
+    counts = torch.nn.functional.one_hot(track.clamp(min=0, max=n_tokens - 1), n_tokens).float().sum(dim=1)
+    probs = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+    entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=1)
+    return entropy / math.log(n_tokens)
+
+
+def max_token_fraction(track: torch.Tensor, n_tokens: int) -> torch.Tensor:
+    counts = torch.nn.functional.one_hot(track.clamp(min=0, max=n_tokens - 1), n_tokens).float().sum(dim=1)
+    return counts.max(dim=1).values / track.shape[1]
 
 
 # -----------------------------
@@ -248,11 +230,11 @@ class MusicLoopEnv(DiscreteEnv):
 def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tensor:
     """Positive terminal reward, returned as log reward.
 
-    The reward stays in log-space and keeps a conservative scale for TB:
-    - drums get a groove anchor: kick on beat 1, snare on beats 2/4
-    - bass is rewarded for landing inside the current chord triad
-    - repeated bars and controlled variations are rewarded explicitly
-    - density terms prevent all-rest and overfilled loops
+    The reward defines a smooth probability landscape rather than one best loop:
+    - drums get mild groove preferences, not hard constraints
+    - bass gets a soft preference for current chord tones
+    - repetition is useful only with enough variation
+    - entropy and anti-dominance terms discourage mode collapse
     """
     B = state_tensor.shape[0]
     grid = state_tensor[:, 1:].view(B, cfg.seq_steps, cfg.tracks).long()
@@ -277,7 +259,7 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
     snare_score = snare[:, backbeat].float().mean(dim=1)
     hat_score = hat[:, off8].float().mean(dim=1)
     drum_density = (drums != REST).float().mean(dim=1)
-    drum_score = 0.60 * kick_score + 0.60 * snare_score + 0.25 * hat_score - 0.25 * (drum_density - 0.45).abs()
+    drum_score = 0.35 * kick_score + 0.35 * snare_score + 0.15 * hat_score - 0.20 * (drum_density - 0.45).abs()
 
     # Harmony: bass should be a chord tone, especially on downbeats.
     bass_active = bass != REST
@@ -298,9 +280,9 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
     lead_density = (lead != REST).float().mean(dim=1)
     chord_downbeat = chord_active.float()[:, downbeat].mean(dim=1)
     bass_downbeat = bass_active.float()[:, downbeat].mean(dim=1)
-    chord_score = 0.35 * chord_downbeat - 0.20 * (chord_active.float().mean(dim=1) - 0.25).abs()
-    bass_score = 0.45 * harmony_score + 0.30 * downbeat_harmony + 0.20 * bass_downbeat - 0.25 * (bass_density - 0.25).abs()
-    lead_score = 0.35 - 0.40 * (lead_density - 0.28).abs()
+    chord_score = 0.25 * chord_downbeat - 0.20 * (chord_active.float().mean(dim=1) - 0.25).abs()
+    bass_score = 0.25 * harmony_score + 0.20 * downbeat_harmony + 0.15 * bass_downbeat - 0.20 * (bass_density - 0.25).abs()
+    lead_score = 0.25 - 0.30 * (lead_density - 0.28).abs()
 
     # Repetition: bar 1 -> bar 2 should lock; later bars can vary but stay related.
     if cfg.bars >= 2:
@@ -310,7 +292,7 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
         repeat_all = (bar1 == bar2).float().mean(dim=(1, 2))
         repeat_rhythm = (bar1[:, :, DRUM] == bar2[:, :, DRUM]).float().mean(dim=1)
         repeat_harmony = (bar1[:, :, CHORD] == bar2[:, :, CHORD]).float().mean(dim=1)
-        repetition_score = 0.45 * repeat_all + 0.35 * repeat_rhythm + 0.30 * repeat_harmony
+        repetition_score = 0.20 * repeat_all + 0.20 * repeat_rhythm + 0.20 * repeat_harmony
         if cfg.bars >= 4:
             bar3 = bars[:, 2]
             bar4 = bars[:, 3]
@@ -318,21 +300,47 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
             variation_24 = (bar2 == bar4).float().mean(dim=(1, 2))
             # Aim for recognizable variation, not a clone and not unrelated noise.
             target = torch.full_like(variation_13, 0.65)
-            repetition_score = repetition_score + 0.25 * (1.0 - (variation_13 - target).abs())
-            repetition_score = repetition_score + 0.20 * (1.0 - (variation_24 - target).abs())
+            repetition_score = repetition_score + 0.15 * (1.0 - (variation_13 - target).abs())
+            repetition_score = repetition_score + 0.10 * (1.0 - (variation_24 - target).abs())
     else:
         repetition_score = torch.zeros(B, device=device)
+
+    track_entropies = torch.stack(
+        [
+            normalized_token_entropy(drums, cfg.n_tokens),
+            normalized_token_entropy(bass, cfg.n_tokens),
+            normalized_token_entropy(chord, cfg.n_tokens),
+            normalized_token_entropy(lead, cfg.n_tokens),
+        ],
+        dim=1,
+    )
+    diversity_score = track_entropies.mean(dim=1)
+    dominance = torch.stack(
+        [
+            max_token_fraction(drums, cfg.n_tokens),
+            max_token_fraction(bass, cfg.n_tokens),
+            max_token_fraction(chord, cfg.n_tokens),
+            max_token_fraction(lead, cfg.n_tokens),
+        ],
+        dim=1,
+    ).mean(dim=1)
+    anti_collapse_score = diversity_score - torch.relu(dominance - 0.55)
 
     score = (
         1.0 * drum_score
         + 1.0 * bass_score
         + 1.0 * chord_score
         + 0.8 * lead_score
-        + 1.0 * repetition_score
+        + 0.7 * repetition_score
+        + 0.6 * anti_collapse_score
     )
+    if B > 1:
+        score = (score - score.mean()) / score.std(unbiased=False).clamp_min(1e-6)
+    score = torch.clamp(score, min=-SCORE_RANGE, max=SCORE_RANGE)
+
     # Return logR directly. Keeping this bounded is critical for Trajectory Balance.
-    log_reward = torch.clamp(score, min=-10.0, max=10.0) / cfg.reward_temperature
-    return torch.clamp(log_reward, min=-5.0, max=5.0)
+    log_reward = score / cfg.reward_temperature
+    return torch.clamp(log_reward, min=LOG_REWARD_MIN, max=LOG_REWARD_MAX)
 
 
 # -----------------------------
