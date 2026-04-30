@@ -56,7 +56,7 @@ class MusicConfig:
     tracks: int = 4
     n_tokens: int = 12  # tokens 0..11; meaning depends on track
     bpm: int = 120
-    reward_temperature: float = 0.3
+    reward_temperature: float = 1.0
 
     @property
     def seq_steps(self) -> int:
@@ -248,8 +248,8 @@ class MusicLoopEnv(DiscreteEnv):
 def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tensor:
     """Positive terminal reward, returned as log reward.
 
-    The reward is intentionally sharp:
-    - drums get a hard groove anchor: kick on beat 1, snare on beats 2/4
+    The reward stays in log-space and keeps a conservative scale for TB:
+    - drums get a groove anchor: kick on beat 1, snare on beats 2/4
     - bass is rewarded for landing inside the current chord triad
     - repeated bars and controlled variations are rewarded explicitly
     - density terms prevent all-rest and overfilled loops
@@ -269,7 +269,7 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
     chord = grid[:, :, CHORD]
     lead = grid[:, :, LEAD]
 
-    # Drum groove: strong anchor first, density second.
+    # Drum groove: anchor first, density second.
     kick = (drums == 1) | (drums == 4)
     snare = (drums == 2) | (drums == 5)
     hat = (drums == 3) | (drums == 4) | (drums == 5)
@@ -277,7 +277,7 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
     snare_score = snare[:, backbeat].float().mean(dim=1)
     hat_score = hat[:, off8].float().mean(dim=1)
     drum_density = (drums != REST).float().mean(dim=1)
-    drum_score = 2.0 * kick_score + 2.0 * snare_score + 0.8 * hat_score - 0.8 * (drum_density - 0.45).abs()
+    drum_score = 0.60 * kick_score + 0.60 * snare_score + 0.25 * hat_score - 0.25 * (drum_density - 0.45).abs()
 
     # Harmony: bass should be a chord tone, especially on downbeats.
     bass_active = bass != REST
@@ -298,9 +298,9 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
     lead_density = (lead != REST).float().mean(dim=1)
     chord_downbeat = chord_active.float()[:, downbeat].mean(dim=1)
     bass_downbeat = bass_active.float()[:, downbeat].mean(dim=1)
-    chord_score = 1.4 * chord_downbeat - 0.5 * (chord_active.float().mean(dim=1) - 0.25).abs()
-    bass_score = 1.3 * harmony_score + 0.9 * downbeat_harmony + 0.5 * bass_downbeat - 0.7 * (bass_density - 0.25).abs()
-    lead_score = 0.8 - 1.2 * (lead_density - 0.28).abs()
+    chord_score = 0.35 * chord_downbeat - 0.20 * (chord_active.float().mean(dim=1) - 0.25).abs()
+    bass_score = 0.45 * harmony_score + 0.30 * downbeat_harmony + 0.20 * bass_downbeat - 0.25 * (bass_density - 0.25).abs()
+    lead_score = 0.35 - 0.40 * (lead_density - 0.28).abs()
 
     # Repetition: bar 1 -> bar 2 should lock; later bars can vary but stay related.
     if cfg.bars >= 2:
@@ -310,7 +310,7 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
         repeat_all = (bar1 == bar2).float().mean(dim=(1, 2))
         repeat_rhythm = (bar1[:, :, DRUM] == bar2[:, :, DRUM]).float().mean(dim=1)
         repeat_harmony = (bar1[:, :, CHORD] == bar2[:, :, CHORD]).float().mean(dim=1)
-        repetition_score = 2.0 * repeat_all + 1.0 * repeat_rhythm + 1.0 * repeat_harmony
+        repetition_score = 0.45 * repeat_all + 0.35 * repeat_rhythm + 0.30 * repeat_harmony
         if cfg.bars >= 4:
             bar3 = bars[:, 2]
             bar4 = bars[:, 3]
@@ -318,20 +318,21 @@ def music_log_reward(state_tensor: torch.Tensor, cfg: MusicConfig) -> torch.Tens
             variation_24 = (bar2 == bar4).float().mean(dim=(1, 2))
             # Aim for recognizable variation, not a clone and not unrelated noise.
             target = torch.full_like(variation_13, 0.65)
-            repetition_score = repetition_score + 1.2 * (1.0 - (variation_13 - target).abs())
-            repetition_score = repetition_score + 0.8 * (1.0 - (variation_24 - target).abs())
+            repetition_score = repetition_score + 0.25 * (1.0 - (variation_13 - target).abs())
+            repetition_score = repetition_score + 0.20 * (1.0 - (variation_24 - target).abs())
     else:
         repetition_score = torch.zeros(B, device=device)
 
     score = (
-        1.4 * drum_score
-        + 1.3 * bass_score
+        1.0 * drum_score
+        + 1.0 * bass_score
         + 1.0 * chord_score
         + 0.8 * lead_score
-        + 1.4 * repetition_score
+        + 1.0 * repetition_score
     )
-    # R = exp(score / T). Clamp only for numerical stability.
-    return torch.clamp(score / cfg.reward_temperature, min=-12.0, max=20.0)
+    # Return logR directly. Keeping this bounded is critical for Trajectory Balance.
+    log_reward = torch.clamp(score, min=-10.0, max=10.0) / cfg.reward_temperature
+    return torch.clamp(log_reward, min=-5.0, max=5.0)
 
 
 # -----------------------------
@@ -442,7 +443,7 @@ def main():
     p.add_argument("--bars", type=int, default=8)
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--logz-lr", type=float, default=1e-3)
+    p.add_argument("--logz-lr", type=float, default=5e-3)
     p.add_argument("--epsilon", type=float, default=0.10)
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--logz-init", type=str, default="auto", help="auto or numeric. auto≈n_cells*log(n_tokens)")
@@ -482,7 +483,8 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         loss = gfn.loss(env, traj)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(gfn.pf_pb_parameters(), 1.0)
+        trainable_params = list(gfn.pf_pb_parameters()) + list(gfn.logz_parameters())
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer.step()
         losses.append(float(loss.item()))
 
